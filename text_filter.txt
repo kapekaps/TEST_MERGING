@@ -1,0 +1,183 @@
+"""Filtering & Tagging
+
+DOCSTRING TO BE COMPLETED
+"""
+
+import os
+from pathlib import Path
+import glob
+import re
+import json
+import logging
+
+from wnodi.filter.helper import FilterHelper, MultiMatchException
+
+import handler.functions as func
+
+class Filter():
+    """
+    CLASS DOC STRING
+    """
+    def __init__(self, logger, debug):
+        self.logger = logger
+        self.debug = debug
+        self.filter_helper = FilterHelper(logger)
+
+    def get_variables(self, alarm, key, pattern):
+        """Finds a key in the alarm and returns the first capturing group result
+
+        Parameters
+        ----------
+        alarm : dict
+            The alarm on which to check
+        key : str
+            The alarm key on which to perform the regex
+        pattern : str
+            The regex pattern to be applied
+
+        Returns
+        -------
+        arg_val
+            The value of the argument returned by the regex match
+        None
+            Returned if the key does not exist or the regex pattern did not match
+        """
+        text = self.filter_helper.traverse_dictionary(alarm, key)
+        if not text:
+            return None
+
+        arg_val = self.filter_helper.get_regex_match(pattern, text, return_group=True)
+
+        return arg_val
+
+    def execute(self, message):
+        """Executes the filter process on an alarm
+
+        Parameters
+        ----------
+        message : dict
+            The source dictionary (an alarm)
+        topic : str
+            The source topic
+
+        Returns
+        -------
+        dict
+            alarm : dict
+                The alarm to be published
+            output_topic : str
+                The output topic to publish to
+            filter_domain : str
+                The filter domain folder name that was matched
+            filter_category : str
+                The filter category folder name that was matched
+            filter_rule : str
+                The filter rule that was matched
+
+        None:
+            Returned if the alarm did not match any filters
+
+        MultiMatchException
+            Returned if the alarm matched more than one filter
+
+        Other Parameters
+        ----------------
+        **kwargs : dict
+            Used for additional arguments, such as 'debug', which is used for testing
+        """
+        cwd = os.getcwd()
+        output_topic = None
+        filter_helper = FilterHelper()
+
+        topic = message['topic']
+        key = message['key'].decode("utf-8")
+        alarm = json.loads(message['value'])
+
+        log_formatter = logging.Formatter(f"[%(asctime)s][%(name)s][%(levelname)s] "
+                                          f"[{key}] %(message)s")
+        self.logger.ch.setFormatter(log_formatter)
+
+        domains_path = os.path.join(cwd, 'domains')
+        if self.debug:
+            domains_path = os.path.join(cwd, 'test', 'domains')
+
+        filters_pattern = os.path.join(domains_path, '**', '**', 'filters.json')
+        filters_file_list = glob.glob(filters_pattern)
+
+        filter_match_counter = 0
+        filter_match_list = []
+        for filters_file in filters_file_list:
+            filters_file_path = Path(filters_file)
+            filters_file_name = os.path.basename(filters_file)
+            filter_domain = os.path.basename(filters_file_path.parents[1])
+            filter_category = os.path.basename(filters_file_path.parents[0])
+
+            self.logger.debug(f"Evaluating filter file "
+                  f"'{filter_domain}/{filters_file_name}'")
+
+            with open(filters_file, 'r', encoding='utf-8') as filter_rules_file:
+                filter_rules = json.load(filter_rules_file)
+
+            for filter_list in filter_rules:
+
+                input_topic = filter_list['input_topic']
+                var_dict = func.check_environment_variable(input_topic)
+                if var_dict:
+                    input_topic = input_topic.format(**var_dict)
+
+                if input_topic == topic:
+                    for filter_dict in filter_list['rules']:
+                        if (filter_helper.filter_dict(alarm, filter_dict['criteria'])
+                            or filter_dict.get('passthrough')):
+
+                            arg_dict = {}
+                            if filter_dict.get('variables'):
+                                for arg_name, value in filter_dict['variables'].items():
+                                    key = next(iter(value))
+                                    pattern = value[key]
+                                    arg_val = self.get_variables(alarm, key, pattern)
+                                    if arg_val is not None:
+                                        arg_dict[arg_name] = arg_val
+                            matching_domain = filter_domain
+                            matching_category = filter_category
+                            matching_rule = filter_dict['name']
+                            filter_match_counter += 1
+                            filter_match_list.append(matching_rule)
+
+                            output_topic = filter_list['output_topic']
+                            var_dict = func.check_environment_variable(output_topic)
+                            if var_dict:
+                                output_topic = output_topic.format(**var_dict)
+
+                            self.logger.info(f"Message matched filter file "
+                                            f"'{matching_domain}/{matching_category}/"\
+                                            f"{filters_file_name}' "
+                                            f"- matching rule: {matching_rule}")
+
+                            if filter_dict.get('tags') and not filter_dict.get('passthrough'):
+                                alarm = filter_helper.tag_dict(alarm, filter_dict['tags'], arg_dict)
+
+                        else:
+                            pass
+
+        if filter_match_counter == 0:
+            if os.environ['TEMPLATE_KIND'] in ['test', 'job']:
+                self.logger.error("Message matched no filters!")
+            return None
+
+        if filter_match_counter > 1:
+            raise MultiMatchException(filter_match_counter=filter_match_counter,
+                                      filter_match_list=filter_match_list,
+                                      message=f"Message matched {filter_match_counter} filters"
+                                              ", but should match no more than one filter! Matching"
+                                              f" filters: {filter_match_list}")
+
+        func.validate_json(alarm)
+
+        return {
+            "alarm": alarm,
+            "output_topic": output_topic,
+            "filter_domain": matching_domain,
+            "filter_category": matching_category,
+            "filter_rule": matching_rule
+        }
